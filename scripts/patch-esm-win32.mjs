@@ -2,13 +2,15 @@
 /**
  * 修复上游 jiti tryNative 在 Windows 上的 ESM URL 错误
  *
- * 上游 bug: 多个 dist 文件中的 tryNative 逻辑使用
+ * 上游 bug 1: 多个 dist 文件中的 tryNative 逻辑使用
  *   shouldPreferNativeJiti(modulePath) || modulePath.includes(`${path.sep}dist${path.sep}`)
- * 在 Windows 上，shouldPreferNativeJiti() 已返回 false，但 || 后面的
- * dist 路径检查绕过了 win32 保护，导致 jiti 尝试用原生 ESM import()
- * 加载原始 Windows 路径 (C:\...)，触发 ERR_UNSUPPORTED_ESM_URL_SCHEME。
+ *   在 Windows 上 || 后面的 dist 路径检查绕过了 win32 保护。
  *
- * 此脚本在构建后 patch dist 文件，添加 process.platform !== "win32" guard。
+ * 上游 bug 2: buildPluginLoaderJitiOptions 中硬编码 tryNative: true，
+ *   被 doctor-contract-registry 和 setup-registry 等直接使用。
+ *
+ * 两者都导致 jiti 尝试用原生 ESM import() 加载 C:\... 路径，
+ * 触发 ERR_UNSUPPORTED_ESM_URL_SCHEME。
  *
  * 用法: node scripts/patch-esm-win32.mjs <openclaw-dir>
  */
@@ -27,26 +29,46 @@ if (!fs.existsSync(distDir)) {
   process.exit(1);
 }
 
-const BUG_PATTERN = /shouldPreferNativeJiti\(modulePath\) \|\| modulePath\.includes\(/g;
-const FIX_STR = 'shouldPreferNativeJiti(modulePath) || (process.platform !== "win32" && modulePath.includes(';
-
 const files = fs.readdirSync(distDir).filter(f => f.endsWith('.js'));
 let patched = 0;
+
+// Bug 1: shouldPreferNativeJiti(modulePath) || modulePath.includes(...)
+const BUG1 = /shouldPreferNativeJiti\(modulePath\) \|\| modulePath\.includes\(/g;
+const FIX1 = 'shouldPreferNativeJiti(modulePath) || (process.platform !== "win32" && modulePath.includes(';
 
 for (const file of files) {
   const filePath = path.join(distDir, file);
   const content = fs.readFileSync(filePath, 'utf8');
-  if (BUG_PATTERN.test(content)) {
-    BUG_PATTERN.lastIndex = 0;
-    const fixed = content.replace(BUG_PATTERN, FIX_STR);
+  if (BUG1.test(content)) {
+    BUG1.lastIndex = 0;
+    const fixed = content.replace(BUG1, FIX1);
     fs.writeFileSync(filePath, fixed, 'utf8');
     patched++;
-    console.log(`  ✅ ${file}`);
+    console.log(`  ✅ ${file} (tryNative || dist路径)`);
   }
 }
 
+// Bug 2: buildPluginLoaderJitiOptions 中 tryNative: true 硬编码
+for (const file of files) {
+  const filePath = path.join(distDir, file);
+  const content = fs.readFileSync(filePath, 'utf8');
+  const fnIdx = content.indexOf('buildPluginLoaderJitiOptions');
+  if (fnIdx === -1) continue;
+  const chunk = content.substring(fnIdx, Math.min(content.length, fnIdx + 500));
+  const target = 'tryNative: true,';
+  const tIdx = chunk.indexOf(target);
+  if (tIdx === -1) continue;
+  const absIdx = fnIdx + tIdx;
+  const fixed = content.substring(0, absIdx)
+    + 'tryNative: process.platform !== "win32",'
+    + content.substring(absIdx + target.length);
+  fs.writeFileSync(filePath, fixed, 'utf8');
+  patched++;
+  console.log(`  ✅ ${file} (tryNative: true 硬编码)`);
+}
+
 if (patched > 0) {
-  console.log(`🔧 ESM Win32 patch: ${patched} 个文件已修复`);
+  console.log(`🔧 ESM Win32 patch: ${patched} 处已修复`);
 } else {
   console.log('ℹ️  ESM Win32 patch: 无需修复（上游可能已修复）');
 }
